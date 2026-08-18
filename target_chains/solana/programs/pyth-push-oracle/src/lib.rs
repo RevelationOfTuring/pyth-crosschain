@@ -8,21 +8,36 @@
 )]
 
 use {
+    // 导入 Anchor 的所有常用类型（Context, Result, Signer, 等等）
     anchor_lang::prelude::*,
     pyth_solana_receiver_sdk::{
-        cpi::accounts::PostUpdate, price_update::PriceUpdateV2, program::PythSolanaReceiver,
-        PostUpdateParams, PYTH_PUSH_ORACLE_ID,
+        // pyth-solana-receiver 的 PostUpdate 账户结构体（用于 CPI），pyth-push-oracle 在 CPI 调用时需要构造它
+        cpi::accounts::PostUpdate,
+        // 价格存储账户的数据结构
+        price_update::PriceUpdateV2,
+        // receiver 程序的 Program 类型（用于 CPI 校验）
+        program::PythSolanaReceiver,
+        // post_update 的指令参数
+        PostUpdateParams,
+        // 本程序的 program ID（主网）
+        PYTH_PUSH_ORACLE_ID,
     },
     pythnet_sdk::{
+        // FeedId 类型别名，Message 枚举（PriceFeedMessage/TwapMessage/...）
         messages::{FeedId, Message},
+        // 从字节数组中反序列化消息
         wire::from_slice,
     },
 };
 
 pub mod sdk;
 
+// 本程序的 program ID
+// PYTH_PUSH_ORACLE_ID 来自 pyth_solana_receiver_sdk，在不同环境（主网 / pro-compatible）下有不同的值
 pub const ID: Pubkey = PYTH_PUSH_ORACLE_ID;
 
+// #[error_code] 是 Anchor 的宏，自动为每个变体生成唯一的错误码（基于变体名称），
+// 并实现 anchor_lang::error::Error trait
 #[error_code]
 pub enum PushOracleError {
     #[msg("Updates must be monotonically increasing")]
@@ -34,46 +49,80 @@ pub enum PushOracleError {
     #[msg("Could not deserialize the message in the update")]
     DeserializeMessageFailed,
 }
+
+// #[program] 是 Anchor 的入口宏，告诉编译器这个模块里的 pub fn都是链上指令。Anchor 会自动生成：
+// - 指令选择器（SHA256 前 8 字节）
+// - 账户反序列化
+// - 指令分发逻辑
 #[program]
 pub mod pyth_push_oracle {
     use super::*;
 
+    // 唯一更新价格函数
+    // 注：ctx 之外的参数就是指令数据。Anchor 会把 params、shard_id、feed_id 按顺序 Borsh序列化，前面加上 8 字节选择器，组成指令数据。
     pub fn update_price_feed(
         ctx: Context<UpdatePriceFeed>,
         params: PostUpdateParams,
         shard_id: u16,
         feed_id: FeedId,
     ) -> Result<()> {
+        // 获取 receiver 程序的 program ID（用于 CPI 调用）
         let cpi_program = ctx.accounts.pyth_solana_receiver.key();
+        // PostUpdate 结构体来自 pyth_solana_receiver_sdk::cpi::accounts::PostUpdate，
+        // 是 receiver 的 post_update 指令需要的账户列表
         let cpi_accounts = PostUpdate {
+            // 注：to_account_info().clone() 是 Solana 的通用做法——将 Anchor 的账户类型转为 AccountInfo（Solana 的底层账户表示），
+            // CPI 需要 AccountInfo 类型。
             payer: ctx.accounts.payer.to_account_info().clone(),
             encoded_vaa: ctx.accounts.encoded_vaa.to_account_info().clone(),
             config: ctx.accounts.config.to_account_info().clone(),
             treasury: ctx.accounts.treasury.to_account_info().clone(),
+            // 注意：价格存储账户是 price_feed_account（PDA），不是用户创建的
             price_update_account: ctx.accounts.price_feed_account.to_account_info().clone(),
             system_program: ctx.accounts.system_program.to_account_info().clone(),
+            // 关键：write_authority 设为 price_feed_account 自己（PDA）
+            // 这意味着 receiver 要求 write_authority 签名 → 只有 push-oracle 能用 PDA 签名
             write_authority: ctx.accounts.price_feed_account.to_account_info().clone(),
         };
 
+        // 构建 PDA 签名种子
         let seeds = &[
+            // 种子 1：分片编号（小端序）
             &shard_id.to_le_bytes(),
+            // 种子 2：feed ID
             feed_id.as_ref(),
+            // 种子 3：bump（来自 Anchor 的约束验证）
+            // ctx.bumps.price_feed_account 是 Anchor 从 #[account(seeds = ..., bump)]约束中自动提取的 bump 值
             &[ctx.bumps.price_feed_account],
         ];
+
+        // signer_seeds 是 Solana 的 invoke_signed 需要的签名种子，证明调用方拥有该 PDA 的签名权限
         let signer_seeds = &[&seeds[..]];
+
+        // 构造 CPI 上下文，PDA 作为 signer
         let cpi_context = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
 
         // Get the timestamp of the price currently stored in the price feed account.
+        // 读取当前price_feed_account里存储的时间戳
         let current_timestamp = {
             if ctx.accounts.price_feed_account.data_is_empty() {
+                // 如果price_feed_account未初始化 → 当前时间戳为 0（任何新价格都会通过）
                 0
             } else {
+                // 如果price_feed_account已经初始化
+                // try_borrow_data() 返回的是 Ref<&[u8]>，这是一个带锁的引用
                 let price_feed_account_data = ctx.accounts.price_feed_account.try_borrow_data()?;
+                // 反序列化 PriceUpdateV2
                 let price_feed_account =
                     PriceUpdateV2::try_deserialize(&mut &price_feed_account_data[..])?;
+                // 提取 publish_time
                 price_feed_account.price_message.publish_time
             }
-        };
+        }; // 注：为什么这里需要 {} 块？
+           // 答：因为后面 CPI 调用 receiver.post_update 时，receiver 内部需要写入 price_feed_account：
+           // 类似如下操作：let mut data = price_feed_account.try_borrow_mut_data()?;
+           // 如果 push-oracle 此时还持有读锁（Ref 没释放），receiver 的 try_borrow_mut_data() 就会失败。
+           // Ref 的释放时机是它离开作用域时。{} 块就是用来精确控制作用域，确保锁在 CPI 调用前释放，在 CPI 调用后重新获取。
 
         // Get the timestamp of the price in the arguments (that we are trying to put in the account).
         // It is a little annoying that we have to redundantly deserialize the message here, but
@@ -81,11 +130,15 @@ pub mod pyth_push_oracle {
         //
         // Note that we don't do any validity checks on the proof etc. here. If the caller passes an
         // invalid message with a newer timestamp, the validity checks will be performed by pyth_solana_receiver.
+
+        // from_slice::<byteorder::BE, Message> 是 pythnet_sdk提供的反序列化函数，按大端序将字节数组解析为 Message 枚举。
         let message =
             from_slice::<byteorder::BE, Message>(params.merkle_price_update.message.as_ref())
                 .map_err(|_| PushOracleError::DeserializeMessageFailed)?;
         let next_timestamp = match message {
+            // 只有当message为Message::PriceFeedMessage时，其中的包含的price_feed_message.publish_time为要更新的feed时间戳
             Message::PriceFeedMessage(price_feed_message) => price_feed_message.publish_time,
+            // TWAP 消息和 PublisherStakeCaps 消息不被 push oracle 支持
             Message::TwapMessage(_) | Message::PublisherStakeCapsMessage(_) => {
                 return err!(PushOracleError::UnsupportedMessageType);
             }
@@ -94,7 +147,11 @@ pub mod pyth_push_oracle {
         // Only update the price feed if the message contains a newer price. Pushing a stale price
         // suceeds without changing the on-chain state.
         if next_timestamp > current_timestamp {
+            // CPI 调用 receiver 的 post_update，完成签名验证和价格写入
             pyth_solana_receiver_sdk::cpi::post_update(cpi_context, params)?;
+
+            // CPI 调用后，验证写入的 feed_id 与参数匹配
+            // 这是为了防止前端传错数据——Merkle 证明的 feed 和参数 feed 不一致
             {
                 let price_feed_account_data = ctx.accounts.price_feed_account.try_borrow_data()?;
                 let price_feed_account =
@@ -110,12 +167,20 @@ pub mod pyth_push_oracle {
     }
 }
 
+// #[derive(Accounts)] 是 Anchor 的宏，自动生成：
+// - 账户反序列化（从 AccountInfo 数组按顺序提取）
+// - 约束验证（#[account(mut)]、seeds + bump、Signer 等）
+// - to_account_metas() 方法（用于客户端构建指令）
 #[derive(Accounts)]
+// #[instruction(params, shard_id, feed_id)] 告诉 Anchor：
+// 这些函数参数在验证 seeds 约束时需要用到（shard_id 和 feed_id 用于 PDA 种子验证）。
 #[instruction(params : PostUpdateParams, shard_id : u16, feed_id : FeedId)]
 pub struct UpdatePriceFeed<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
+    // Anchor 校验它确实是 receiver program
     pub pyth_solana_receiver: Program<'info, PythSolanaReceiver>,
+    // 以下三个account的约束校验都交给cpi调用，在Pyth Solana Receiver中做
     /// CHECK: Checked by CPI into the Pyth Solana Receiver
     pub encoded_vaa: UncheckedAccount<'info>,
     /// CHECK: Checked by CPI into the Pyth Solana Receiver
@@ -123,8 +188,13 @@ pub struct UpdatePriceFeed<'info> {
     /// CHECK: Checked by CPI into the Pyth Solana Receiver
     #[account(mut)]
     pub treasury: UncheckedAccount<'info>,
+    // 此处Anchor做了两件事：
+    // 1. 检查账户可写
+    // 2. 检查传入的账户地址是pyth-push-oracle的PDA(shard_id, feed_id)，不是任意地址
+    // 不做：因为是 UncheckedAccount，不校验 owner、不反序列化数据、不验证数据内容
     /// CHECK: This account's seeds are checked
     #[account(mut, seeds = [&shard_id.to_le_bytes(), &feed_id], bump)]
     pub price_feed_account: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
+// 注：Account<'info, T>：Anchor 会自动反序列化数据并验证 owner，UncheckedAccount<'info>：不反序列化，不验证 owner，只做地址级别的约束
